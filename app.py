@@ -26,21 +26,14 @@ st.sidebar.header("🔍 Search Parameters")
 input_ben = st.sidebar.text_input(
     "Enter Billed Entity Number (BEN)", value="139692"
 ).strip()
-reseller_rate = st.sidebar.number_input(
-    "Your Proposed Target Rate ($/Mbps/mo)",
-    min_value=0.10,
-    max_value=25.00,
-    value=1.50,
-    step=0.25,
-)
 
 
 # -----------------------------------------------------------------------------
-# 3. HELPER & DATA FETCHING FUNCTIONS
+# 3. DATA FETCHING & PROCESSING FUNCTIONS
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=1800)
 def fetch_ben_history(ben):
-    """Fetches all C1 Form 471 line items across ALL funding years for a given BEN."""
+    """Fetches C1 Form 471 line items across ALL funding years for a given BEN."""
     params = {
         "$limit": 1000,
         "$where": f"ben = '{ben}' AND form_471_service_type_name = 'Data Transmission and/or Internet Access'",
@@ -60,10 +53,10 @@ def fetch_ben_history(ben):
 
 @st.cache_data(ttl=1800)
 def fetch_zip_competitors(zip_code):
-    """Fetches all C1 lines items for schools within the same ZIP code across recent years."""
+    """Fetches C1 lines items for all entities within the same ZIP code."""
     params = {
         "$limit": 2000,
-        "$where": f"ros_physical_zipcode = '{zip_code}' AND form_471_service_type_name = 'Data Transmission and/or Internet Access'",
+        "$where": f"zipcode = '{zip_code}' AND form_471_service_type_name = 'Data Transmission and/or Internet Access'",
         "$order": "funding_year DESC",
     }
     try:
@@ -71,13 +64,20 @@ def fetch_zip_competitors(zip_code):
         if res.status_code == 200:
             return pd.DataFrame(res.json())
         else:
-            return pd.DataFrame()
+            # Fallback to physical zipcode column if 'zipcode' alias differs
+            params["$where"] = (
+                f"ros_physical_zipcode = '{zip_code}' AND"
+                " form_471_service_type_name = 'Data Transmission and/or"
+                " Internet Access'"
+            )
+            res2 = requests.get(USAC_API_URL, params=params, timeout=15)
+            return pd.DataFrame(res2.json()) if res2.status_code == 200 else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
 
 def process_broadband_metrics(df):
-    """Processes speeds into Mbps and calculates Monthly Cost per Mbps."""
+    """Normalizes speeds to Mbps and calculates Monthly Cost per Mbps."""
     if df.empty:
         return df
 
@@ -104,7 +104,7 @@ def process_broadband_metrics(df):
 
 
 # -----------------------------------------------------------------------------
-# 4. MAIN APP CONTROLLER
+# 4. MAIN APPLICATION
 # -----------------------------------------------------------------------------
 if not input_ben:
     st.info("👈 Please enter a BEN in the sidebar to begin.")
@@ -117,15 +117,22 @@ else:
             f"No Category 1 Broadband records found in USAC database for BEN: **{input_ben}**."
         )
         st.caption(
-            "Note: Verify if this entity uses Category 1 services or if filings exist under a parent District BEN."
+            "Note: Verify if this entity uses Category 1 services or if filings exist under a main District BEN."
         )
     else:
         # Extract Entity Information
         entity_name = processed_ben_df["organization_name"].iloc[0]
         entity_state = processed_ben_df.get("state", pd.Series(["N/A"])).iloc[0]
-        entity_zip = processed_ben_df.get(
-            "ros_physical_zipcode", pd.Series(["N/A"])
-        ).iloc[0]
+
+        # Extract ZIP code checking multiple common USAC schema names
+        entity_zip = "N/A"
+        for zip_col in ["ros_physical_zipcode", "zipcode", "zip_code"]:
+            if (
+                zip_col in processed_ben_df.columns
+                and not pd.isna(processed_ben_df[zip_col].iloc[0])
+            ):
+                entity_zip = str(processed_ben_df[zip_col].iloc[0]).split("-")[0].strip()
+                break
 
         st.markdown(f"## 🏢 **{entity_name}**")
         st.markdown(
@@ -159,7 +166,6 @@ else:
             ]
             clean_df = processed_ben_df[cols_exist].copy()
 
-            # Rename for display
             rename_map = {
                 "funding_year": "Funding Year",
                 "funding_request_number": "FRN",
@@ -208,28 +214,21 @@ else:
                         f"No surrounding school filings found in ZIP Code **{entity_zip}**."
                     )
                 else:
-                    # Filter out zero values for stats
                     valid_zip_df = zip_df[zip_df["cost_per_mbps"] > 0]
                     avg_zip_rate = valid_zip_df["cost_per_mbps"].mean()
 
-                    # Find current BEN latest rate
                     latest_ben_row = processed_ben_df.iloc[0]
                     curr_rate = latest_ben_row.get("cost_per_mbps", 0)
                     curr_speed = latest_ben_row.get("speed_mbps", 0)
                     curr_cost = latest_ben_row.get("monthly_cost", 0)
 
-                    # Benchmarking Summary Metrics
-                    b1, b2, b3 = st.columns(3)
+                    b1, b2 = st.columns(2)
                     b1.metric("Current BEN Rate", f"${curr_rate:.2f} / Mbps")
                     b2.metric("ZIP Code Avg Rate", f"${avg_zip_rate:.2f} / Mbps")
-                    b3.metric(
-                        "Your Proposed Target Rate", f"${reseller_rate:.2f} / Mbps"
-                    )
 
                     st.markdown("---")
                     st.markdown("### 🏆 Active Telecom Providers in this ZIP Code")
 
-                    # Aggregate Providers operating in this ZIP Code
                     provider_summary = (
                         valid_zip_df.groupby(
                             ["service_provider_name", "spin"]
@@ -262,21 +261,7 @@ else:
                     )
 
                     st.markdown("---")
-                    st.markdown("### 💡 Recommended Upgrade & Reseller Opportunities")
-
-                    # Recommendation Engine
-                    if curr_speed > 0:
-                        target_cost_same_speed = curr_speed * reseller_rate
-                        target_cost_double_speed = (curr_speed * 2) * reseller_rate
-
-                        st.success(f"""
-                        **Carrier Recommendation for {entity_name}:**
-                        * **Current Setup:** {curr_speed:,.0f} Mbps @ **${curr_cost:,.2f}/month** (${curr_rate:.2f}/Mbps)
-                        * **Option A (Cost Savings at Same Speed):** Keep **{curr_speed:,.0f} Mbps** at your wholesale rate of **${reseller_rate:.2f}/Mbps** $\rightarrow$ **${target_cost_same_speed:,.2f}/month** (Save **${curr_cost - target_cost_same_speed:,.2f}/mo**).
-                        * **Option B (Bandwidth Upgrade):** Double speed to **{curr_speed * 2:,.0f} Mbps** at your wholesale rate $\rightarrow$ **${target_cost_double_speed:,.2f}/month**.
-                        """)
-
-                    st.markdown("### All ZIP Code School Contracts")
+                    st.markdown("### All Local Area School Contracts")
                     zip_display_cols = [
                         "funding_year",
                         "organization_name",
