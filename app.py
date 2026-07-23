@@ -14,10 +14,9 @@ st.set_page_config(
 
 st.title("📡 USAC E-Rate Form 471 BEN Search & Local Benchmarking")
 st.caption(
-    "Powered by the USAC E-Rate FCC Form 471 Open Data API (gifc-3grz)."
+    "Powered by the USAC E-Rate Open Data SODA API."
 )
 
-# USAC SODA API Endpoints
 LINE_ITEMS_API = "https://opendata.usac.org/resource/hbj5-2bpj.json"
 BASIC_INFO_API = "https://opendata.usac.org/resource/9s6i-myen.json"
 
@@ -31,37 +30,52 @@ input_ben = st.sidebar.text_input(
 
 
 # -----------------------------------------------------------------------------
-# 3. DATA FETCHING & PROCESSING ENGINE
+# 3. DATA FETCHING ENGINE (ROBUST SODA QUERIES)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=1800)
-def fetch_ben_line_items(ben):
-    """Fetches C1 broadband line items across ALL funding years for a target BEN."""
+def fetch_ben_line_items(ben_str):
+    """Fetches C1 line items using dual string/numeric BEN handling and broad service type matching."""
+    clean_ben = str(ben_str).strip()
+    
+    # Query matching string OR numeric BEN, plus flexible C1 service type strings
+    where_clause = (
+        f"(ben = '{clean_ben}' OR ben = {clean_ben}) "
+        f"AND (form_471_service_type_name like '%Internet%' OR form_471_service_type_name like '%Data%')"
+    )
+    
     params = {
         "$limit": 1000,
-        "$where": f"ben = '{ben}' AND form_471_service_type_name = 'Data Transmission and/or Internet Access'",
+        "$where": where_clause,
         "$order": "funding_year DESC",
     }
+    
     try:
         res = requests.get(LINE_ITEMS_API, params=params, timeout=15)
-        return pd.DataFrame(res.json()) if res.status_code == 200 else pd.DataFrame()
+        if res.status_code == 200 and len(res.json()) > 0:
+            return pd.DataFrame(res.json())
+        
+        # Fallback Query: Query without service type filter if standard search returns empty
+        params["$where"] = f"ben = '{clean_ben}' OR ben = {clean_ben}"
+        res_fallback = requests.get(LINE_ITEMS_API, params=params, timeout=15)
+        return pd.DataFrame(res_fallback.json()) if res_fallback.status_code == 200 else pd.DataFrame()
     except Exception as e:
-        st.error(f"Error connecting to USAC API: {e}")
+        st.error(f"Error fetching BEN data: {e}")
         return pd.DataFrame()
 
 
 @st.cache_data(ttl=1800)
-def fetch_ben_zip_code(ben):
-    """Fetches official Billed Entity ZIP code and State from Form 471 Basic Info dataset."""
+def fetch_ben_metadata(ben_str):
+    """Fetches Entity ZIP Code and State metadata."""
+    clean_ben = str(ben_str).strip()
     params = {
-        "$limit": 5,
-        "$where": f"ben = '{ben}'",
-        "$select": "ben, organization_name, org_zipcode, org_state",
+        "$limit": 1,
+        "$where": f"ben = '{clean_ben}' OR ben = {clean_ben}",
     }
     try:
         res = requests.get(BASIC_INFO_API, params=params, timeout=15)
         if res.status_code == 200 and len(res.json()) > 0:
             item = res.json()[0]
-            raw_zip = item.get("org_zipcode", "")
+            raw_zip = item.get("org_zipcode") or item.get("zipcode") or ""
             clean_zip = str(raw_zip).split("-")[0].strip() if raw_zip else "N/A"
             return clean_zip, item.get("org_state", "N/A"), item.get("organization_name", "")
     except Exception:
@@ -71,40 +85,40 @@ def fetch_ben_zip_code(ben):
 
 @st.cache_data(ttl=1800)
 def fetch_zip_line_items(zip_code):
-    """Finds all BENs in the target ZIP code, then retrieves their C1 Broadband Line Items."""
+    """Fetches C1 Broadband line items for entities sharing the same physical ZIP code."""
     if not zip_code or zip_code == "N/A":
         return pd.DataFrame()
 
-    # Step 1: Find all BENs in this ZIP Code
-    basic_params = {
-        "$limit": 1000,
+    # Step 1: Find BENs in the target ZIP
+    params_zip = {
+        "$limit": 500,
         "$where": f"org_zipcode like '{zip_code}%'",
         "$select": "ben",
     }
     try:
-        res_basic = requests.get(BASIC_INFO_API, params=basic_params, timeout=15)
+        res_basic = requests.get(BASIC_INFO_API, params=params_zip, timeout=15)
         if res_basic.status_code != 200 or not res_basic.json():
             return pd.DataFrame()
 
-        bens_in_zip = list(set([item["ben"] for item in res_basic.json() if "ben" in item]))
+        bens_in_zip = list(set([str(item["ben"]) for item in res_basic.json() if "ben" in item]))
         if not bens_in_zip:
             return pd.DataFrame()
 
-        # Step 2: Query Line Items for those BENs
-        formatted_bens = ", ".join([f"'{b}'" for b in bens_in_zip[:50]])
-        line_params = {
+        # Step 2: Query FRN Line Items for all BENs in this ZIP
+        formatted_bens = ", ".join([f"'{b}'" for b in bens_in_zip[:40]])
+        params_lines = {
             "$limit": 2000,
-            "$where": f"ben in({formatted_bens}) AND form_471_service_type_name = 'Data Transmission and/or Internet Access'",
+            "$where": f"ben in({formatted_bens}) AND (form_471_service_type_name like '%Internet%' OR form_471_service_type_name like '%Data%')",
             "$order": "funding_year DESC",
         }
-        res_lines = requests.get(LINE_ITEMS_API, params=line_params, timeout=15)
+        res_lines = requests.get(LINE_ITEMS_API, params=params_lines, timeout=15)
         return pd.DataFrame(res_lines.json()) if res_lines.status_code == 200 else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
 
 def process_metrics(df):
-    """Converts speeds to Mbps and calculates Monthly Cost / Mbps."""
+    """Calculates Speed in Mbps and Monthly Cost per Mbps."""
     if df.empty:
         return df
 
@@ -136,22 +150,25 @@ def process_metrics(df):
 if not input_ben:
     st.info("👈 Enter a Billed Entity Number (BEN) in the sidebar to search.")
 else:
-    # 1. Fetch BEN Form 471 Line Items
+    # 1. Load Form 471 Line Items
     raw_ben_df = fetch_ben_line_items(input_ben)
     processed_ben_df = process_metrics(raw_ben_df)
 
-    # 2. Fetch Entity Metadata & Physical ZIP Code
-    entity_zip, entity_state, meta_name = fetch_ben_zip_code(input_ben)
+    # 2. Load Entity Metadata
+    entity_zip, entity_state, meta_name = fetch_ben_metadata(input_ben)
 
     if processed_ben_df.empty and not meta_name:
-        st.warning(f"No Form 471 records found for BEN: **{input_ben}**.")
+        st.error(f"No USAC records found for BEN **{input_ben}**. Please verify the entity number.")
     else:
-        # Extract Entity Name
-        entity_name = (
-            processed_ben_df["organization_name"].iloc[0]
-            if not processed_ben_df.empty and "organization_name" in processed_ben_df.columns
-            else meta_name
-        )
+        # Extract Entity Name safely
+        if not processed_ben_df.empty and "organization_name" in processed_ben_df.columns:
+            entity_name = processed_ben_df["organization_name"].iloc[0]
+        else:
+            entity_name = meta_name if meta_name else f"Entity #{input_ben}"
+
+        # Extract State/ZIP from Line Items if metadata table missed it
+        if entity_state == "N/A" and not processed_ben_df.empty and "state" in processed_ben_df.columns:
+            entity_state = processed_ben_df["state"].iloc[0]
 
         st.markdown(f"## 🏢 **{entity_name}**")
         st.markdown(
@@ -167,10 +184,10 @@ else:
         # TAB 1: FORM 471 DETAILS
         # -----------------------------------------------------------------------------
         with tab1:
-            st.subheader("Historical Form 471 C1 Broadband Contracts")
+            st.subheader("Historical Form 471 Category 1 Broadband Contracts")
 
             if processed_ben_df.empty:
-                st.info("No Category 1 Broadband line items recorded for this BEN.")
+                st.warning("No Category 1 Broadband line items found for this BEN.")
             else:
                 display_cols = [
                     "funding_year",
@@ -216,13 +233,13 @@ else:
                 )
 
         # -----------------------------------------------------------------------------
-        # TAB 2: ZIP CODE BENCHMARKING
+        # TAB 2: LOCAL BENCHMARKING
         # -----------------------------------------------------------------------------
         with tab2:
             st.subheader(f"Local Carrier Benchmarking in ZIP Code: {entity_zip}")
 
             if entity_zip == "N/A":
-                st.warning("Could not identify a physical ZIP code for this entity.")
+                st.warning("Could not establish a physical ZIP code for this BEN to perform local benchmarking.")
             else:
                 zip_raw = fetch_zip_line_items(entity_zip)
                 zip_df = process_metrics(zip_raw)
