@@ -13,17 +13,17 @@ st.set_page_config(
 )
 
 st.title("📡 USAC E-Rate Form 471 BEN Search & Benchmarking")
-st.caption("Powered by USAC E-Rate Open Data (Form 471 FRN Line Items).")
+st.caption("Powered by USAC E-Rate Form 471 Open Data API.")
 
-# Direct USAC Form 471 FRN Line Items SODA Endpoint
 USAC_API_URL = "https://opendata.usac.org/resource/hbj5-2bpj.json"
 
 # -----------------------------------------------------------------------------
 # 2. SIDEBAR INPUTS
 # -----------------------------------------------------------------------------
 st.sidebar.header("🔍 Search Parameters")
+# Updated default BEN to 139468 (Bald Knob School District)
 input_ben = st.sidebar.text_input(
-    "Enter Billed Entity Number (BEN)", value="139692"
+    "Enter Billed Entity Number (BEN)", value="139468"
 ).strip()
 
 
@@ -32,58 +32,55 @@ input_ben = st.sidebar.text_input(
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=1800)
 def fetch_ben_line_items(ben_str):
-    """Fetches line items directly for target BEN without fragile SQL syntax."""
+    """Queries USAC SODA API for all C1 line items associated with a BEN."""
     clean_ben = str(ben_str).strip()
 
-    # Query directly by parameter to avoid SODA engine SQL string formatting errors
     params = {
-        "$limit": 2000,
+        "$limit": 1000,
         "ben": clean_ben,
         "$order": "funding_year DESC",
     }
 
     try:
-        response = requests.get(USAC_API_URL, params=params, timeout=15)
-        if response.status_code == 200:
-            data = response.json()
+        res = requests.get(USAC_API_URL, params=params, timeout=15)
+        if res.status_code == 200:
+            data = res.json()
             if not data:
-                return pd.DataFrame(), f"No records found in USAC database for BEN {clean_ben}."
-            
-            df = pd.DataFrame(data)
-            return df, None
+                return pd.DataFrame(), f"No records found in USAC database for BEN **{clean_ben}**."
+            return pd.DataFrame(data), None
         else:
-            return pd.DataFrame(), f"USAC API Error (HTTP {response.status_code}): {response.text}"
+            return pd.DataFrame(), f"USAC API Error ({res.status_code}): {res.text}"
     except Exception as e:
-        return pd.DataFrame(), f"Network connection failed: {str(e)}"
+        return pd.DataFrame(), f"Connection error: {e}"
 
 
 @st.cache_data(ttl=1800)
 def fetch_state_benchmarks(state_code, funding_year):
-    """Fetches state-wide broadband contracts for comparative benchmarking."""
+    """Fetches state-wide broadband line items for comparative benchmarking."""
     if not state_code or state_code == "N/A":
         return pd.DataFrame()
 
     params = {
-        "$limit": 3000,
+        "$limit": 2000,
         "state": state_code,
         "funding_year": str(funding_year),
     }
 
     try:
-        response = requests.get(USAC_API_URL, params=params, timeout=15)
-        if response.status_code == 200:
-            return pd.DataFrame(response.json())
+        res = requests.get(USAC_API_URL, params=params, timeout=15)
+        if res.status_code == 200:
+            return pd.DataFrame(res.json())
     except Exception:
         pass
     return pd.DataFrame()
 
 
-def process_and_filter_metrics(df):
-    """Filters C1 Broadband services and calculates Cost/Mbps metrics."""
+def process_metrics(df):
+    """Processes bandwidth speeds and calculates cost metrics."""
     if df.empty:
         return df
 
-    # Filter for Category 1 Internet / Data Transmission
+    # Filter for Category 1 Internet/Data Transmission
     if "form_471_service_type_name" in df.columns:
         c1_mask = df["form_471_service_type_name"].astype(str).str.contains(
             "Internet|Data Transmission", case=False, na=False
@@ -93,24 +90,22 @@ def process_and_filter_metrics(df):
     if df.empty:
         return df
 
-    # Monthly Cost Conversion
     df["monthly_cost"] = pd.to_numeric(
         df.get("monthly_recurring_eligible_cost", 0), errors="coerce"
     ).fillna(0)
 
-    # Speed Conversion
     df["speed"] = pd.to_numeric(
         df.get("download_speed", 0), errors="coerce"
     ).fillna(0)
 
-    def calculate_mbps(row):
+    def normalize_mbps(row):
         unit = str(row.get("download_speed_units", "")).lower()
         speed = row["speed"]
         if "gbps" in unit or "giga" in unit:
             return speed * 1000
         return speed
 
-    df["speed_mbps"] = df.apply(calculate_mbps, axis=1)
+    df["speed_mbps"] = df.apply(normalize_mbps, axis=1)
     df["cost_per_mbps"] = df.apply(
         lambda r: (r["monthly_cost"] / r["speed_mbps"]) if r["speed_mbps"] > 0 else 0,
         axis=1,
@@ -122,7 +117,7 @@ def process_and_filter_metrics(df):
 # 4. MAIN APPLICATION
 # -----------------------------------------------------------------------------
 if not input_ben:
-    st.info("👈 Enter a Billed Entity Number (BEN) in the sidebar to run search.")
+    st.info("👈 Enter a Billed Entity Number (BEN) in the sidebar to search.")
 else:
     with st.spinner(f"Querying USAC Open Data for BEN {input_ben}..."):
         raw_ben_df, error_msg = fetch_ben_line_items(input_ben)
@@ -130,18 +125,17 @@ else:
     if error_msg:
         st.error(error_msg)
     else:
-        processed_df = process_and_filter_metrics(raw_ben_df)
+        processed_df = process_metrics(raw_ben_df)
 
         if processed_df.empty:
-            st.warning(f"Found BEN **{input_ben}**, but no Category 1 Broadband line items were identified.")
+            st.warning(f"Found entity for BEN **{input_ben}**, but no Category 1 Broadband contracts were found.")
         else:
-            # Extract Metadata
             entity_name = processed_df["organization_name"].iloc[0] if "organization_name" in processed_df.columns else f"BEN {input_ben}"
             entity_state = processed_df["state"].iloc[0] if "state" in processed_df.columns else "N/A"
             latest_year = processed_df["funding_year"].iloc[0] if "funding_year" in processed_df.columns else "N/A"
 
             st.markdown(f"## 🏢 **{entity_name}**")
-            st.markdown(f"**BEN:** `{input_ben}` | **State:** `{entity_state}` | **Latest Recorded Year:** `{latest_year}`")
+            st.markdown(f"**BEN:** `{input_ben}` | **State:** `{entity_state}` | **Latest Recorded Filing:** `{latest_year}`")
 
             tab1, tab2 = st.tabs(["📋 Form 471 Line Items", "🗺️ State Broadband Benchmarking"])
 
@@ -201,7 +195,7 @@ else:
                 st.subheader(f"Broadband Carrier Benchmarking for State: {entity_state}")
 
                 state_raw = fetch_state_benchmarks(entity_state, latest_year)
-                state_df = process_and_filter_metrics(state_raw)
+                state_df = process_metrics(state_raw)
 
                 if state_df.empty:
                     st.info(f"No additional state comparison data returned for {entity_state} in {latest_year}.")
