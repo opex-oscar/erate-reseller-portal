@@ -12,62 +12,108 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-st.title("📡 USAC E-Rate BEN Search & Regional Benchmarking")
-st.caption("Lookup Form 471 Category 1 Broadband details by Billed Entity Number (BEN).")
+st.title("📡 USAC E-Rate Form 471 BEN Search & Local Benchmarking")
+st.caption(
+    "Powered by the USAC E-Rate FCC Form 471 Open Data API (gifc-3grz)."
+)
 
-USAC_API_URL = "https://opendata.usac.org/resource/hbj5-2bpj.json"
+# USAC SODA API Endpoints
+LINE_ITEMS_API = "https://opendata.usac.org/resource/hbj5-2bpj.json"
+BASIC_INFO_API = "https://opendata.usac.org/resource/9s6i-myen.json"
 
 # -----------------------------------------------------------------------------
 # 2. SIDEBAR INPUTS
 # -----------------------------------------------------------------------------
 st.sidebar.header("🔍 Search Parameters")
-input_ben = st.sidebar.text_input("Enter Billed Entity Number (BEN)", value="139692").strip()
+input_ben = st.sidebar.text_input(
+    "Enter Billed Entity Number (BEN)", value="139692"
+).strip()
+
 
 # -----------------------------------------------------------------------------
-# 3. API FETCHING & NORMALIZATION FUNCTIONS
+# 3. DATA FETCHING & PROCESSING ENGINE
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=1800)
-def fetch_ben_data(ben):
-    """Queries USAC SODA API for all C1 line items associated with a BEN."""
+def fetch_ben_line_items(ben):
+    """Fetches C1 broadband line items across ALL funding years for a target BEN."""
     params = {
         "$limit": 1000,
         "$where": f"ben = '{ben}' AND form_471_service_type_name = 'Data Transmission and/or Internet Access'",
         "$order": "funding_year DESC",
     }
     try:
-        res = requests.get(USAC_API_URL, params=params, timeout=15)
-        if res.status_code == 200:
-            return pd.DataFrame(res.json())
-        else:
-            st.error(f"USAC API Error ({res.status_code}): {res.text}")
-            return pd.DataFrame()
+        res = requests.get(LINE_ITEMS_API, params=params, timeout=15)
+        return pd.DataFrame(res.json()) if res.status_code == 200 else pd.DataFrame()
     except Exception as e:
-        st.error(f"Connection Error: {e}")
+        st.error(f"Error connecting to USAC API: {e}")
         return pd.DataFrame()
 
+
 @st.cache_data(ttl=1800)
-def fetch_state_competitors(state_code, funding_year):
-    """Queries USAC SODA API for state-wide C1 broadband line items for benchmarking."""
+def fetch_ben_zip_code(ben):
+    """Fetches official Billed Entity ZIP code and State from Form 471 Basic Info dataset."""
     params = {
-        "$limit": 3000,
-        "$where": f"state = '{state_code}' AND funding_year = '{funding_year}' AND form_471_service_type_name = 'Data Transmission and/or Internet Access'",
+        "$limit": 5,
+        "$where": f"ben = '{ben}'",
+        "$select": "ben, organization_name, org_zipcode, org_state",
     }
     try:
-        res = requests.get(USAC_API_URL, params=params, timeout=15)
-        if res.status_code == 200:
-            return pd.DataFrame(res.json())
-        else:
+        res = requests.get(BASIC_INFO_API, params=params, timeout=15)
+        if res.status_code == 200 and len(res.json()) > 0:
+            item = res.json()[0]
+            raw_zip = item.get("org_zipcode", "")
+            clean_zip = str(raw_zip).split("-")[0].strip() if raw_zip else "N/A"
+            return clean_zip, item.get("org_state", "N/A"), item.get("organization_name", "")
+    except Exception:
+        pass
+    return "N/A", "N/A", ""
+
+
+@st.cache_data(ttl=1800)
+def fetch_zip_line_items(zip_code):
+    """Finds all BENs in the target ZIP code, then retrieves their C1 Broadband Line Items."""
+    if not zip_code or zip_code == "N/A":
+        return pd.DataFrame()
+
+    # Step 1: Find all BENs in this ZIP Code
+    basic_params = {
+        "$limit": 1000,
+        "$where": f"org_zipcode like '{zip_code}%'",
+        "$select": "ben",
+    }
+    try:
+        res_basic = requests.get(BASIC_INFO_API, params=basic_params, timeout=15)
+        if res_basic.status_code != 200 or not res_basic.json():
             return pd.DataFrame()
+
+        bens_in_zip = list(set([item["ben"] for item in res_basic.json() if "ben" in item]))
+        if not bens_in_zip:
+            return pd.DataFrame()
+
+        # Step 2: Query Line Items for those BENs
+        formatted_bens = ", ".join([f"'{b}'" for b in bens_in_zip[:50]])
+        line_params = {
+            "$limit": 2000,
+            "$where": f"ben in({formatted_bens}) AND form_471_service_type_name = 'Data Transmission and/or Internet Access'",
+            "$order": "funding_year DESC",
+        }
+        res_lines = requests.get(LINE_ITEMS_API, params=line_params, timeout=15)
+        return pd.DataFrame(res_lines.json()) if res_lines.status_code == 200 else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
+
 def process_metrics(df):
-    """Calculates Speed in Mbps and Monthly Cost / Mbps."""
+    """Converts speeds to Mbps and calculates Monthly Cost / Mbps."""
     if df.empty:
         return df
 
-    df["monthly_cost"] = pd.to_numeric(df.get("monthly_recurring_eligible_cost", 0), errors="coerce").fillna(0)
-    df["speed"] = pd.to_numeric(df.get("download_speed", 0), errors="coerce").fillna(0)
+    df["monthly_cost"] = pd.to_numeric(
+        df.get("monthly_recurring_eligible_cost", 0), errors="coerce"
+    ).fillna(0)
+    df["speed"] = pd.to_numeric(
+        df.get("download_speed", 0), errors="coerce"
+    ).fillna(0)
 
     def normalize_mbps(row):
         unit = str(row.get("download_speed_units", "")).lower()
@@ -78,132 +124,172 @@ def process_metrics(df):
 
     df["speed_mbps"] = df.apply(normalize_mbps, axis=1)
     df["cost_per_mbps"] = df.apply(
-        lambda r: (r["monthly_cost"] / r["speed_mbps"]) if r["speed_mbps"] > 0 else 0, axis=1
+        lambda r: (r["monthly_cost"] / r["speed_mbps"]) if r["speed_mbps"] > 0 else 0,
+        axis=1,
     )
     return df
+
 
 # -----------------------------------------------------------------------------
 # 4. MAIN APPLICATION
 # -----------------------------------------------------------------------------
 if not input_ben:
-    st.info("👈 Please enter a BEN in the sidebar to begin.")
+    st.info("👈 Enter a Billed Entity Number (BEN) in the sidebar to search.")
 else:
-    raw_ben_data = fetch_ben_data(input_ben)
-    ben_df = process_metrics(raw_ben_data)
+    # 1. Fetch BEN Form 471 Line Items
+    raw_ben_df = fetch_ben_line_items(input_ben)
+    processed_ben_df = process_metrics(raw_ben_df)
 
-    if ben_df.empty:
-        st.warning(f"No Category 1 Broadband records found in USAC database for BEN: **{input_ben}**.")
+    # 2. Fetch Entity Metadata & Physical ZIP Code
+    entity_zip, entity_state, meta_name = fetch_ben_zip_code(input_ben)
+
+    if processed_ben_df.empty and not meta_name:
+        st.warning(f"No Form 471 records found for BEN: **{input_ben}**.")
     else:
-        # Extract metadata
-        entity_name = ben_df["organization_name"].iloc[0] if "organization_name" in ben_df.columns else "Unknown Entity"
-        entity_state = ben_df["state"].iloc[0] if "state" in ben_df.columns else "N/A"
-        latest_year = ben_df["funding_year"].iloc[0] if "funding_year" in ben_df.columns else "N/A"
+        # Extract Entity Name
+        entity_name = (
+            processed_ben_df["organization_name"].iloc[0]
+            if not processed_ben_df.empty and "organization_name" in processed_ben_df.columns
+            else meta_name
+        )
 
         st.markdown(f"## 🏢 **{entity_name}**")
-        st.markdown(f"**BEN:** `{input_ben}` | **State:** `{entity_state}` | **Latest Recorded Filing:** `{latest_year}`")
+        st.markdown(
+            f"**BEN:** `{input_ben}` | **State:** `{entity_state}` | **ZIP Code:** `{entity_zip}`"
+        )
 
-        tab1, tab2 = st.tabs(["📋 Form 471 History & Line Items", "🗺️ State / Carrier Benchmarking"])
+        tab1, tab2 = st.tabs([
+            "📋 Form 471 History & Line Items",
+            "🗺️ ZIP Code Provider Benchmarking",
+        ])
 
         # -----------------------------------------------------------------------------
         # TAB 1: FORM 471 DETAILS
         # -----------------------------------------------------------------------------
         with tab1:
-            st.subheader("Historical Form 471 Category 1 Broadband Line Items")
+            st.subheader("Historical Form 471 C1 Broadband Contracts")
 
-            display_cols = [
-                "funding_year",
-                "funding_request_number",
-                "service_provider_name",
-                "spin",
-                "speed_mbps",
-                "monthly_cost",
-                "cost_per_mbps",
-                "form_471_product_name",
-            ]
-
-            cols_exist = [c for c in display_cols if c in ben_df.columns]
-            clean_df = ben_df[cols_exist].copy()
-
-            rename_map = {
-                "funding_year": "Funding Year",
-                "funding_request_number": "FRN",
-                "service_provider_name": "Service Provider",
-                "spin": "SPIN",
-                "speed_mbps": "Speed (Mbps)",
-                "monthly_cost": "Monthly Cost ($)",
-                "cost_per_mbps": "Cost / Mbps ($)",
-                "form_471_product_name": "Product Description",
-            }
-            clean_df = clean_df.rename(columns=rename_map)
-
-            st.dataframe(
-                clean_df.style.format({
-                    "Speed (Mbps)": "{:,.0f} Mbps",
-                    "Monthly Cost ($)": "${:,.2f}",
-                    "Cost / Mbps ($)": "${:,.2f}",
-                }),
-                use_container_width=True,
-            )
-
-            st.download_button(
-                label="📥 Export BEN Line Items (CSV)",
-                data=clean_df.to_csv(index=False),
-                file_name=f"BEN_{input_ben}_471_History.csv",
-                mime="text/csv",
-            )
-
-        # -----------------------------------------------------------------------------
-        # TAB 2: BENCHMARKING & CARRIERS
-        # -----------------------------------------------------------------------------
-        with tab2:
-            st.subheader(f"Broadband Carrier Benchmarking for {entity_state} ({latest_year})")
-
-            state_raw = fetch_state_competitors(entity_state, latest_year)
-            state_df = process_metrics(state_raw)
-
-            if state_df.empty:
-                st.info(f"No additional state-wide comparisons available for {entity_state} in {latest_year}.")
+            if processed_ben_df.empty:
+                st.info("No Category 1 Broadband line items recorded for this BEN.")
             else:
-                valid_state_df = state_df[state_df["cost_per_mbps"] > 0]
-                avg_state_rate = valid_state_df["cost_per_mbps"].mean()
+                display_cols = [
+                    "funding_year",
+                    "funding_request_number",
+                    "service_provider_name",
+                    "spin",
+                    "speed_mbps",
+                    "monthly_cost",
+                    "cost_per_mbps",
+                    "form_471_product_name",
+                ]
 
-                latest_ben_row = ben_df.iloc[0]
-                curr_rate = latest_ben_row.get("cost_per_mbps", 0)
-                curr_speed = latest_ben_row.get("speed_mbps", 0)
-                curr_provider = latest_ben_row.get("service_provider_name", "N/A")
+                cols_exist = [c for c in display_cols if c in processed_ben_df.columns]
+                clean_df = processed_ben_df[cols_exist].copy()
 
-                b1, b2 = st.columns(2)
-                b1.metric("Current BEN Rate", f"${curr_rate:.2f} / Mbps", f"Provider: {curr_provider}")
-                b2.metric(f"{entity_state} State Average Rate", f"${avg_state_rate:.2f} / Mbps")
-
-                st.markdown("---")
-                st.markdown(f"### 🏆 Top Telecom Providers in {entity_state}")
-
-                provider_summary = (
-                    valid_state_df.groupby(["service_provider_name", "spin"])
-                    .agg(
-                        avg_cost_per_mbps=("cost_per_mbps", "mean"),
-                        max_speed_offered=("speed_mbps", "max"),
-                        total_contracts=("ben", "count"),
-                    )
-                    .reset_index()
-                    .sort_values(by="avg_cost_per_mbps", ascending=True)
-                )
-
-                provider_summary = provider_summary.rename(
+                clean_df = clean_df.rename(
                     columns={
-                        "service_provider_name": "Carrier / Provider",
+                        "funding_year": "Funding Year",
+                        "funding_request_number": "FRN",
+                        "service_provider_name": "Service Provider",
                         "spin": "SPIN",
-                        "avg_cost_per_mbps": f"Avg $/Mbps in {entity_state}",
-                        "max_speed_offered": "Max Speed Offered",
-                        "total_contracts": "Total Contracts in State",
+                        "speed_mbps": "Speed (Mbps)",
+                        "monthly_cost": "Monthly Cost ($)",
+                        "cost_per_mbps": "Cost / Mbps ($)",
+                        "form_471_product_name": "Product Description",
                     }
                 )
 
                 st.dataframe(
-                    provider_summary.style.format({
-                        f"Avg $/Mbps in {entity_state}": "${:,.2f}",
-                        "Max Speed Offered": "{:,.0f} Mbps",
+                    clean_df.style.format({
+                        "Speed (Mbps)": "{:,.0f} Mbps",
+                        "Monthly Cost ($)": "${:,.2f}",
+                        "Cost / Mbps ($)": "${:,.2f}",
                     }),
                     use_container_width=True,
                 )
+
+                st.download_button(
+                    label="📥 Export BEN Line Items (CSV)",
+                    data=clean_df.to_csv(index=False),
+                    file_name=f"BEN_{input_ben}_471_History.csv",
+                    mime="text/csv",
+                )
+
+        # -----------------------------------------------------------------------------
+        # TAB 2: ZIP CODE BENCHMARKING
+        # -----------------------------------------------------------------------------
+        with tab2:
+            st.subheader(f"Local Carrier Benchmarking in ZIP Code: {entity_zip}")
+
+            if entity_zip == "N/A":
+                st.warning("Could not identify a physical ZIP code for this entity.")
+            else:
+                zip_raw = fetch_zip_line_items(entity_zip)
+                zip_df = process_metrics(zip_raw)
+
+                if zip_df.empty:
+                    st.info(f"No additional school contracts found in ZIP Code **{entity_zip}**.")
+                else:
+                    valid_zip_df = zip_df[zip_df["cost_per_mbps"] > 0]
+                    avg_zip_rate = valid_zip_df["cost_per_mbps"].mean()
+
+                    curr_rate = (
+                        processed_ben_df.iloc[0].get("cost_per_mbps", 0)
+                        if not processed_ben_df.empty
+                        else 0
+                    )
+
+                    b1, b2 = st.columns(2)
+                    b1.metric("Target BEN Rate", f"${curr_rate:.2f} / Mbps")
+                    b2.metric(f"ZIP {entity_zip} Avg Rate", f"${avg_zip_rate:.2f} / Mbps")
+
+                    st.markdown("---")
+                    st.markdown("### 🏆 Active Telecom Providers in this ZIP Code")
+
+                    provider_summary = (
+                        valid_zip_df.groupby(["service_provider_name", "spin"])
+                        .agg(
+                            avg_cost_per_mbps=("cost_per_mbps", "mean"),
+                            max_speed_offered=("speed_mbps", "max"),
+                            total_contracts=("ben", "count"),
+                        )
+                        .reset_index()
+                        .sort_values(by="avg_cost_per_mbps", ascending=True)
+                    )
+
+                    provider_summary = provider_summary.rename(
+                        columns={
+                            "service_provider_name": "Carrier / Provider",
+                            "spin": "SPIN",
+                            "avg_cost_per_mbps": "Avg $/Mbps in ZIP",
+                            "max_speed_offered": "Max Speed Offered",
+                            "total_contracts": "Local Contracts Count",
+                        }
+                    )
+
+                    st.dataframe(
+                        provider_summary.style.format({
+                            "Avg $/Mbps in ZIP": "${:,.2f}",
+                            "Max Speed Offered": "{:,.0f} Mbps",
+                        }),
+                        use_container_width=True,
+                    )
+
+                    st.markdown("---")
+                    st.markdown("### All ZIP Code School Contracts")
+                    zip_display_cols = [
+                        "funding_year",
+                        "organization_name",
+                        "service_provider_name",
+                        "speed_mbps",
+                        "monthly_cost",
+                        "cost_per_mbps",
+                    ]
+                    st.dataframe(
+                        zip_df[[c for c in zip_display_cols if c in zip_df.columns]].style.format({
+                            "speed_mbps": "{:,.0f} Mbps",
+                            "monthly_cost": "${:,.2f}",
+                            "cost_per_mbps": "${:,.2f}",
+                        }),
+                        use_container_width=True,
+                    )
