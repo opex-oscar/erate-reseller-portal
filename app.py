@@ -85,35 +85,30 @@ reseller_rate_mbps = st.sidebar.number_input(
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600)
 def load_usac_data(state, year, category, ben_search="", school_search=""):
-    """Fetches FRN Line Item data from USAC SODA API based on Category and Search Filters."""
+    """Fetches FRN Line Item data from USAC SODA API with error protection."""
     svc_type = (
         "Data Transmission and/or Internet Access"
         if category == "C1"
         else "Internal Connections"
     )
 
-    # Base WHERE clause
     where_conditions = [
-        f"funding_year = {year}",
+        f"funding_year = '{year}'",
         f"form_471_service_type_name = '{svc_type}'",
     ]
 
-    # Add optional filters dynamically
     if ben_search:
         where_conditions.append(f"ben = '{ben_search}'")
     elif school_search:
-        # Searches for partial case-insensitive text matches in entity name
-        where_conditions.append(
-            f"lower(organization_name) like '%{school_search.lower()}%'"
-        )
+        clean_name = school_search.upper().replace("'", "''")
+        where_conditions.append(f"organization_name like '%{clean_name}%'")
     else:
-        # Default to filtering by state if no BEN/Name is specified
         where_conditions.append(f"state = '{state}'")
 
     where_clause = " AND ".join(where_conditions)
 
     params = {
-        "$limit": 3000,
+        "$limit": 2000,
         "$where": where_clause,
     }
 
@@ -123,7 +118,7 @@ def load_usac_data(state, year, category, ben_search="", school_search=""):
             return pd.DataFrame(response.json())
         else:
             st.error(
-                f"USAC API Error {response.status_code}: {response.text}"
+                f"USAC API Query Error ({response.status_code}): {response.text}"
             )
             return pd.DataFrame()
     except Exception as e:
@@ -160,12 +155,14 @@ with tab1:
     if not c1_raw.empty:
         df = c1_raw.copy()
         df["monthly_cost"] = pd.to_numeric(
-            df["monthly_recurring_eligible_cost"], errors="coerce"
+            df.get("monthly_recurring_eligible_cost", 0), errors="coerce"
         )
-        df["speed"] = pd.to_numeric(df["download_speed"], errors="coerce")
+        df["speed"] = pd.to_numeric(
+            df.get("download_speed", 0), errors="coerce"
+        )
 
         def get_mbps(row):
-            unit = str(row["download_speed_units"]).lower()
+            unit = str(row.get("download_speed_units", "")).lower()
             return (
                 row["speed"] * 1000
                 if "gbps" in unit or "giga" in unit
@@ -176,7 +173,7 @@ with tab1:
         df = df[(df["speed_mbps"] > 0) & (df["monthly_cost"] > 0)]
         df["cost_per_mbps"] = df["monthly_cost"] / df["speed_mbps"]
 
-        state_avg = df["cost_per_mbps"].mean()
+        state_avg = df["cost_per_mbps"].mean() if not df.empty else 0
 
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Analyzed Accounts", len(df))
@@ -192,16 +189,24 @@ with tab1:
         st.markdown("---")
         st.markdown("### 🎯 Matched Accounts & Pricing Breakdown")
 
-        display_df = high_cost_df[[
-            "ben",
-            "organization_name",
-            "service_provider_name",
-            "spin",
-            "speed_mbps",
-            "monthly_cost",
-            "cost_per_mbps",
-            "annual_savings",
-        ]].sort_values(by="annual_savings", ascending=False)
+        cols_to_show = [
+            c
+            for c in [
+                "ben",
+                "organization_name",
+                "service_provider_name",
+                "spin",
+                "speed_mbps",
+                "monthly_cost",
+                "cost_per_mbps",
+                "annual_savings",
+            ]
+            if c in high_cost_df.columns
+        ]
+
+        display_df = high_cost_df[cols_to_show].sort_values(
+            by="annual_savings", ascending=False
+        )
 
         st.dataframe(
             display_df.style.format({
@@ -235,7 +240,7 @@ with tab2:
     if not c2_raw.empty:
 
         def check_eol(model_str):
-            if not model_str:
+            if not model_str or pd.isna(model_str):
                 return "Unknown", "N/A"
             for part, info in C2_EOL_MATRIX.items():
                 if part.lower() in str(model_str).lower():
@@ -243,27 +248,34 @@ with tab2:
             return "Active", "N/A"
 
         c2_df = c2_raw.copy()
-        c2_df[["eol_status", "next_gen_recommendation"]] = c2_df[
-            "model"
-        ].apply(lambda x: pd.Series(check_eol(x)))
-
-        eol_hits = c2_df[c2_df["eol_status"] == "EOL"]
+        if "model" in c2_df.columns:
+            c2_df[["eol_status", "next_gen_recommendation"]] = c2_df[
+                "model"
+            ].apply(lambda x: pd.Series(check_eol(x)))
+            eol_hits = c2_df[c2_df["eol_status"] == "EOL"]
+        else:
+            eol_hits = pd.DataFrame()
 
         st.metric("Detected EOL Systems", len(eol_hits))
 
-        st.markdown("### ⚠️ Sunset Hardware Flagged for Upgrade")
-        st.dataframe(
-            eol_hits[[
-                "ben",
-                "organization_name",
-                "manufacturer",
-                "model",
-                "next_gen_recommendation",
-                "spin",
-                "service_provider_name",
-            ]],
-            use_container_width=True,
-        )
+        if not eol_hits.empty:
+            st.markdown("### ⚠️ Sunset Hardware Flagged for Upgrade")
+            cols_c2 = [
+                c
+                for c in [
+                    "ben",
+                    "organization_name",
+                    "manufacturer",
+                    "model",
+                    "next_gen_recommendation",
+                    "spin",
+                    "service_provider_name",
+                ]
+                if c in eol_hits.columns
+            ]
+            st.dataframe(eol_hits[cols_c2], use_container_width=True)
+        else:
+            st.info("No End-of-Life hardware matches detected in this query.")
     else:
         st.warning("No Category 2 records found matching your search criteria.")
 
@@ -310,12 +322,13 @@ with tab3:
     p2.metric(
         "Monthly Client Savings",
         f"${monthly_savings:,.2f}",
-        f"{((monthly_savings)/curr_monthly)*100:.1f}% reduction",
+        f"{((monthly_savings)/curr_monthly)*100:.1f}% reduction"
+        if curr_monthly > 0
+        else "0%",
     )
     p3.metric("Annual District Savings", f"${annual_savings:,.2f}")
 
     st.info(
         f"**Net District Out-of-Pocket Cost:** With an **{e_rate_discount}% E-Rate Discount**, "
         f"the district's net monthly payment under your SPIN **({master_spin})** will be **${out_of_pocket_prop:,.2f}/mo**."
-    )
     )
