@@ -85,7 +85,7 @@ reseller_rate_mbps = st.sidebar.number_input(
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=3600)
 def load_usac_data(state, year, category, ben_search="", school_search=""):
-    """Fetches FRN Line Item data from USAC SODA API with error protection."""
+    """Fetches FRN Line Item data from USAC SODA API with global BEN override."""
     svc_type = (
         "Data Transmission and/or Internet Access"
         if category == "C1"
@@ -97,6 +97,7 @@ def load_usac_data(state, year, category, ben_search="", school_search=""):
         f"form_471_service_type_name = '{svc_type}'",
     ]
 
+    # If BEN or Name is entered, bypass the State filter
     if ben_search:
         where_conditions.append(f"ben = '{ben_search}'")
     elif school_search:
@@ -124,7 +125,6 @@ def load_usac_data(state, year, category, ben_search="", school_search=""):
     except Exception as e:
         st.error(f"Failed to connect to USAC SODA API: {e}")
         return pd.DataFrame()
-
 
 # -----------------------------------------------------------------------------
 # 5. DASHBOARD TABS
